@@ -1,0 +1,409 @@
+openapi: 3.0.3
+info:
+  title: AulaLink - API de autorización de recogida
+  version: 1.0.0
+  description: API para registrar, auditar y consultar solicitudes de recogida.
+servers:
+  - url: https://api.example.edu/api/v1
+paths:
+  /pickup-requests:
+    post:
+      operationId: createPickupRequest
+      summary: Crear una solicitud de autorización de recogida
+      security:
+        - bearerAuth: []
+      x-required-roles: [security, prefect, teacher]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [request, photo]
+              properties:
+                request:
+                  $ref: '#/components/schemas/CreatePickupRequest'
+                photo:
+                  type: string
+                  format: binary
+                  description: Fotografía JPEG, PNG o WebP; máximo 5 MiB.
+            encoding:
+              request:
+                contentType: application/json
+      responses:
+        '201':
+          description: Solicitud registrada y notificación puesta en la cola duradera.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PickupRequest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Alumno o tutor principal no encontrado/activo.
+        '409':
+          description: Clave de idempotencia usada con datos distintos.
+        '413':
+          description: Fotografía superior a 5 MiB.
+        '415':
+          description: Formato o contenido de imagen no permitido.
+  /pickup-requests/{requestId}:
+    get:
+      operationId: getPickupRequest
+      summary: Consultar el estado actual
+      security:
+        - bearerAuth: []
+      x-required-roles: [administrator, direction, security, prefect, teacher]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Estado actual.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PickupRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /pickup-requests/{requestId}/cancel:
+    post:
+      operationId: cancelPickupRequest
+      summary: Cancelar una solicitud pendiente
+      description: Una solicitud cancelada no puede ser autorizada por una respuesta posterior.
+      security:
+        - bearerAuth: []
+      x-required-roles: [administrator, direction, security, prefect, teacher]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Estado cancelado o ya cancelado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PickupRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Solo se puede cancelar una solicitud pendiente.
+  /pickup-requests/{requestId}/events:
+    get:
+      operationId: streamPickupRequestEvents
+      summary: Transmitir cambios mediante Server-Sent Events
+      description: >
+        Envía una instantánea inicial y cambios de estado. El cliente debe volver
+        a consultar el recurso al recibir el evento; la conexión requiere un
+        cliente SSE que admita el encabezado Bearer.
+      security:
+        - bearerAuth: []
+      x-required-roles: [administrator, direction, security, prefect, teacher]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Flujo SSE.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  id: 2
+                  event: pickup-request.updated
+                  data: {"id":"8c8f2608-38eb-42b9-a5b9-4adfeb375c7c","status":"authorized","stateVersion":2}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /integrations/n8n/pickup-events:
+    post:
+      operationId: receiveN8nPickupEvent
+      summary: Recibir eventos de WhatsApp procesados por n8n
+      description: >
+        Verifica HMAC-SHA256 del timestamp y cuerpo HTTP sin modificar, ventana
+        anti-replay de cinco minutos e idempotencia del eventId.
+      parameters:
+        - name: X-Webhook-Timestamp
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Webhook-Signature
+          in: header
+          required: true
+          description: v1=<hex HMAC-SHA256(timestamp + salto de línea + cuerpo crudo)>.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/OutboundAcceptedEvent'
+                - $ref: '#/components/schemas/DeliveryStatusEvent'
+                - $ref: '#/components/schemas/DecisionReceivedEvent'
+                - $ref: '#/components/schemas/NotificationFailedEvent'
+                - $ref: '#/components/schemas/EscalationEvent'
+              discriminator:
+                propertyName: eventType
+      responses:
+        '202':
+          description: Evento aplicado, duplicado o tardío registrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Mensaje o decisión no corresponde al estado/recurso.
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    RequestId:
+      name: requestId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 200
+  schemas:
+    CreatePickupRequest:
+      type: object
+      required: [studentId, pickupPerson]
+      properties:
+        studentId:
+          type: string
+          format: uuid
+        pickupPerson:
+          type: object
+          required: [fullName, relationshipToStudent]
+          properties:
+            fullName:
+              type: string
+              minLength: 1
+              maxLength: 200
+            relationshipToStudent:
+              type: string
+              minLength: 1
+              maxLength: 100
+    PickupRequest:
+      type: object
+      required:
+        [id, studentId, pickupPerson, status, createdAt, escalationDueAt, decidedAt, cancelledAt, stateVersion]
+      properties:
+        id:
+          type: string
+          format: uuid
+        studentId:
+          type: string
+          format: uuid
+        pickupPerson:
+          type: object
+          required: [fullName, relationshipToStudent]
+          properties:
+            fullName:
+              type: string
+            relationshipToStudent:
+              type: string
+        status:
+          type: string
+          enum: [pending, authorized, rejected, cancelled]
+        createdAt:
+          type: string
+          format: date-time
+        escalationDueAt:
+          type: string
+          format: date-time
+          nullable: true
+        decidedAt:
+          type: string
+          format: date-time
+          nullable: true
+        cancelledAt:
+          type: string
+          format: date-time
+          nullable: true
+        stateVersion:
+          type: integer
+          format: int64
+    EventBase:
+      type: object
+      required: [eventId, eventType, schemaVersion, requestId, occurredAt]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        eventType:
+          type: string
+        schemaVersion:
+          type: integer
+          enum: [1]
+        requestId:
+          type: string
+          format: uuid
+        occurredAt:
+          type: string
+          format: date-time
+    OutboundAcceptedEvent:
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [recipientRole, recipientPhone, whatsappMessageId]
+          properties:
+            eventType:
+              type: string
+              enum: [whatsapp.outbound.accepted]
+            recipientRole:
+              type: string
+              enum: [primary, secondary]
+            recipientPhone:
+              type: string
+            whatsappMessageId:
+              type: string
+    DeliveryStatusEvent:
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [whatsappMessageId, deliveryStatus]
+          properties:
+            eventType:
+              type: string
+              enum: [whatsapp.delivery.status]
+            whatsappMessageId:
+              type: string
+            deliveryStatus:
+              type: string
+              enum: [sent, delivered, read, failed]
+    DecisionReceivedEvent:
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required:
+            [decision, responderPhone, incomingMessageId, contextMessageId, buttonId]
+          properties:
+            eventType:
+              type: string
+              enum: [pickup.decision.received]
+            decision:
+              type: string
+              enum: [authorize, reject]
+            responderPhone:
+              type: string
+            incomingMessageId:
+              type: string
+            contextMessageId:
+              type: string
+            buttonId:
+              type: string
+    NotificationFailedEvent:
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [recipientRole, errorCode]
+          properties:
+            eventType:
+              type: string
+              enum: [whatsapp.outbound.failed]
+            recipientRole:
+              type: string
+              enum: [primary, secondary]
+            errorCode:
+              type: string
+    EscalationEvent:
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [channel, result]
+          properties:
+            eventType:
+              type: string
+              enum: [pickup.escalation.completed]
+            channel:
+              type: string
+              enum: [secondary_guardian_whatsapp, registered_pickup_whatsapp, email]
+            result:
+              type: string
+              enum: [accepted, delivered, failed]
+            providerMessageId:
+              type: string
+              nullable: true
+            errorCode:
+              type: string
+              nullable: true
+    WebhookAck:
+      type: object
+      required: [eventId, disposition]
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        disposition:
+          type: string
+          enum: [applied, ignored_late, duplicate]
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+  responses:
+    BadRequest:
+      description: Solicitud inválida.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Firma o autenticación inválida/ausente.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Rol insuficiente.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Recurso no encontrado.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
